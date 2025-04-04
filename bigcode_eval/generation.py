@@ -5,39 +5,11 @@ from typing import List, Optional
 
 from accelerate.utils import set_seed
 from torch.utils.data.dataloader import DataLoader
-from transformers import StoppingCriteria, StoppingCriteriaList
+from transformers import StoppingCriteriaList
 
 from bigcode_eval.utils import TokenizedDataset, complete_code
+from bigcode_eval.criteria import EndOfFunctionCriteria, TooLongFunctionCriteria
 
-
-class EndOfFunctionCriteria(StoppingCriteria):
-    """Custom `StoppingCriteria` which checks if all generated functions in the batch are completed."""
-    def __init__(self, start_length, eof_strings, tokenizer, check_fn=None):
-        self.start_length = start_length
-        self.eof_strings = eof_strings
-        self.tokenizer = tokenizer
-        if check_fn is None:
-            check_fn = lambda decoded_generation: any(
-                [stop_string in decoded_generation for stop_string in self.eof_strings]
-            )
-        self.check_fn = check_fn
-
-    def __call__(self, input_ids, scores, **kwargs):
-        """Returns true if all generated sequences contain any of the end-of-function strings."""
-        decoded_generations = self.tokenizer.batch_decode(input_ids[:, self.start_length :])
-        return all([self.check_fn(decoded_generation) for decoded_generation in decoded_generations])
-
-class TooLongFunctionCriteria(StoppingCriteria):
-    """Custom `StoppingCriteria` which checks if the generated function is too long by a certain multiplier based on input length."""
-
-    def __init__(self, input_length, multiplier):
-        self.input_length = input_length
-        self.multiplier = multiplier
-
-    def __call__(self, input_ids, scores, **kwargs):
-        """Returns true if generated sequence is too long."""
-        return input_ids.shape[1] > int(self.input_length * self.multiplier)
-        
 
 def parallel_generations(
         task,
@@ -104,8 +76,13 @@ def parallel_generations(
                 task.stop_words.append(token)
     else:
         instruction_tokens = None
+
+    # Calculate actual number of samples based on filtered dataset
+    n_samples = args.n_samples if hasattr(args, "n_samples") else 1
+    total_samples = n_tasks * n_samples
     if accelerator.is_main_process:
-        print(f"number of problems for this task is {n_tasks}")
+        print(f"Generating {n_samples} samples for each of {n_tasks} problems (total {total_samples} samples)...")
+
     n_copies = ceil(args.n_samples / args.batch_size)
 
     ds_tokenized = TokenizedDataset(

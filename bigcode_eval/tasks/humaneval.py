@@ -48,7 +48,7 @@ class GeneralHumanEval(Task):
 
     DATASET_PATH = "openai_humaneval"
 
-    def __init__(self, strip_prompt, k=[1, 10, 100], num_workers=16, timeout=3.0):
+    def __init__(self, strip_prompt, k=[1, 10, 100], num_workers=16, timeout=3.0, **kwargs):
         super().__init__(
             stop_words=[
                 "\nclass",
@@ -63,6 +63,7 @@ class GeneralHumanEval(Task):
             requires_execution=True,
         )
         self.strip_prompt = strip_prompt
+        self.args = type('Args', (), kwargs)() if kwargs else type('Args', (), {})()
         # Parse pass@k values from arguments and validate against n_samples
         if hasattr(self.args, "pass_at_k"):
             k_values = [int(k) for k in self.args.pass_at_k.split(",")]
@@ -162,19 +163,20 @@ class GeneralHumanEval(Task):
             # Calculate number of problems to keep
             num_problems = len(dataset)
             num_to_keep = max(1, int(num_problems * self.args.percent_problems))
-
-            if (
-                hasattr(self.args, "sequential_problems")
-                and self.args.sequential_problems
-            ):
-                # Take first n% of problems
+            
+            if hasattr(self.args, "sequential_problems") and self.args.sequential_problems:
+                # Take first n% of problems sequentially
                 dataset = dataset.select(range(num_to_keep))
             else:
-                # Randomly sample n% of problems
-                indices = list(range(num_problems))
-                random.seed(self.args.seed)  # Use same seed for reproducibility
-                selected_indices = random.sample(indices, num_to_keep)
-                dataset = dataset.select(selected_indices)
+                # Randomly sample n% of problems with fixed seed
+                if hasattr(self.args, "seed"):
+                    random.seed(self.args.seed)
+                    indices = list(range(num_problems))
+                    selected_indices = sorted(random.sample(indices, num_to_keep))
+                    dataset = dataset.select(selected_indices)
+                else:
+                    # If no seed provided, use sequential as fallback
+                    dataset = dataset.select(range(num_to_keep))
         return dataset
 
     def format_prompt(self, prompt_text):

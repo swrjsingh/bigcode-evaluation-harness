@@ -8,6 +8,7 @@ from typing import List, Optional
 import torch
 from torch.utils.data import IterableDataset
 from tqdm import tqdm
+from bigcode_eval.criteria import EndOfFunctionCriteria, TooLongFunctionCriteria
 
 INFILL_MODE = False
 INSTRUCTION_MODE = False
@@ -41,7 +42,7 @@ class TokenizedDataset(IterableDataset):
         self.num_devices = num_devices
         self.max_length = max_length
         self.limit_start = limit_start
-        self.n_tasks = n_tasks
+        self.n_tasks = len(dataset) if n_tasks is None else n_tasks  # Use filtered dataset length
         self.n_copies = n_copies
         self.prefix = prefix
         self.has_encoder = has_encoder
@@ -239,131 +240,148 @@ def complete_code(
     intermediate_save_generations_path: Optional[str] = None,
     **gen_kwargs,
 ):
-    """Generate multiple codes for each task in the dataset using multiple GPUs with accelerate.
-    dataloader sends all the prompts from the evalution dataset to the model as the following:
-    [p_0_0, p_0_1, ..., p_0_nc-1, p_1_0, ..., p_nt-1_nc-1] where nc is the number of copies of the prompt,
-    and nt is the number of tasks. nc is such that num_samples(for each task)= nc * batch_size
+    """Complete code generations for a batch of tasks
+    Args:
+        task: task instance
+        accelerator: accelerator instance
+        model: model instance
+        tokenizer: tokenizer instance
+        dataloader: dataloader instance
+        n_tasks: number of tasks to generate (after filtering)
+        limit_start: index to start from
+        batch_size: batch size
+        prefix: prefix to add to each prompt
+        instruction_tokens: tokens to use for instruction-tuning
+        postprocess: whether to postprocess the generated code
+        is_wrapped: whether the model is wrapped in accelerate
+        save_every_k_tasks: save generations every k tasks
+        intermediate_generations: list of intermediate generations
+        intermediate_save_generations_path: path to save intermediate generations
+        **gen_kwargs: additional arguments for model.generate
     """
-    # keep track of the list of generated codes
-    # where len(code_gens) = n_tasks and len(code_gens[0]) = number of generated code samples
-    code_gens: List[List[Optional[str]]] = [[] for _ in range(n_tasks)]
-    generations = [] if not intermediate_generations else intermediate_generations
-    gen_token_dict = defaultdict(list)  # dict of list of generated tokens
-    for step, batch in tqdm(
-        enumerate(dataloader),
-        total=math.ceil(
-            n_tasks * dataloader.dataset.n_copies / accelerator.num_processes
-        ),
-    ):
-        with torch.no_grad():
-            if task.stop_words:
-                # Set the start_length after which to check for stopping to be the longest input ignoring padding
-                max_len = batch["input_len"].max().item()
-                if "ids_encoder" in batch:
-                    max_len += 1  # Add 1 for decoder_start_token_id
-                gen_kwargs["stopping_criteria"][0].start_length = max_len
-            if hasattr(task, "max_length_multiplier") and task.max_length_multiplier:
-                idx = 1 if task.stop_words else 0
-                gen_kwargs["stopping_criteria"][idx].input_length = (
-                    batch["input_len"].max().item()
-                )
+    model = model if is_wrapped else accelerator.unwrap_model(model)
+    all_input_ids = []
+    all_input_ids_encoder = []
+    all_task_ids = []
+    all_input_len = []
+    all_input_len_encoder = []
 
-            inputs = batch["ids"][:, : batch["input_len"]] if tokenizer.padding_side == "right" else batch["ids"]
-            if "ids_encoder" in batch:
-                if is_wrapped:
-                    generated_tokens = accelerator.unwrap_model(model).generate(
-                        decoder_input_ids=inputs,
-                        input_ids=batch["ids_encoder"][:, : batch["input_len_encoder"]],
-                        num_return_sequences=batch_size,
-                        decoder_start_token_id=tokenizer.pad_token_id,
-                        eos_token_id=tokenizer.eos_token_id,
-                        **gen_kwargs,
-                    )
-                else:
-                    generated_tokens = model.generate(
-                        decoder_input_ids=inputs,
-                        input_ids=batch["ids_encoder"][:, : batch["input_len_encoder"]],
-                        num_return_sequences=batch_size,
-                        decoder_start_token_id=tokenizer.pad_token_id,
-                        eos_token_id=tokenizer.eos_token_id,
-                        **gen_kwargs,
-                    )
-            else:
-                if is_wrapped:
-                    # 8bit and 4bit models are wrapped in accelerator
-                    generated_tokens = accelerator.unwrap_model(model).generate(
-                        input_ids=inputs,
-                        num_return_sequences=batch_size,
-                        **gen_kwargs,
-                    )
-                else:
-                    # In transformers (>= 4.40.2), if the length of input_ids == max_length, a ValueError is thrown.
-                    # We want to ignore this error in order to reproduce old results with mbpp.
-                    try:
-                        generated_tokens = model.generate(
-                            input_ids=inputs,
-                            num_return_sequences=batch_size,
-                            **gen_kwargs,
-                        )
-                    except ValueError as e:
-                        # When the length of input_ids == max_length, the generation is the same as the input
-                        if str(e).startswith(f"Input length of input_ids is {inputs.shape[1]}, but `max_length` is set to {gen_kwargs['max_length']}"):
-                            warnings.warn(f"An error with the following message was thrown: {e}. Returning the input as the generation, for higher scores consider using a larger `max_length`")
-                            generated_tokens = inputs
-                        else:
-                            raise e
+    # Collect all inputs first
+    for batch in dataloader:
+        task_ids = batch.pop("task_id")
+        input_len = batch.pop("input_len")
+        if "ids_encoder" in batch:
+            input_len_encoder = batch.pop("input_len_encoder")
+            all_input_len_encoder.extend(input_len_encoder.tolist())
+            all_input_ids_encoder.extend(batch["ids_encoder"].tolist())
+        all_input_ids.extend(batch["ids"].tolist())
+        all_task_ids.extend(task_ids.tolist())
+        all_input_len.extend(input_len.tolist())
 
-            # each task is generated batch_size times
-            generated_tasks = batch["task_id"].repeat(batch_size)
-            generated_tokens = accelerator.pad_across_processes(
-                generated_tokens, dim=1, pad_index=tokenizer.pad_token_id
+    code_gens = defaultdict(list)
+    n_samples = batch_size
+    total_batch = math.ceil(len(all_task_ids) / n_samples)
+
+    if accelerator.is_main_process:
+        print(f"Processing {len(all_task_ids)} total inputs in {total_batch} batches")
+        pbar = tqdm(total=total_batch, desc="Generating samples")
+    else:
+        pbar = None
+
+    for i in range(0, len(all_task_ids), n_samples):
+        # Get batch
+        batch_input_ids = all_input_ids[i : i + n_samples]
+        batch_task_ids = all_task_ids[i : i + n_samples]
+        batch_input_len = all_input_len[i : i + n_samples]
+        if all_input_ids_encoder:
+            batch_input_ids_encoder = all_input_ids_encoder[i : i + n_samples]
+            batch_input_len_encoder = all_input_len_encoder[i : i + n_samples]
+
+        # Prepare model inputs
+        batch_input_ids = torch.tensor(batch_input_ids).to(accelerator.device)
+        if all_input_ids_encoder:
+            batch_input_ids_encoder = torch.tensor(batch_input_ids_encoder).to(
+                accelerator.device
             )
 
-            generated_tokens, generated_tasks = accelerator.gather(
-                (generated_tokens, generated_tasks)
+        # Update stopping criteria with actual input length
+        if "stopping_criteria" in gen_kwargs:
+            for criteria in gen_kwargs["stopping_criteria"]:
+                if isinstance(criteria, EndOfFunctionCriteria):
+                    criteria.start_length = batch_input_len[0]
+                elif isinstance(criteria, TooLongFunctionCriteria):
+                    criteria.input_length = batch_input_len[0]
+
+        # Generate
+        if all_input_ids_encoder:
+            # seq2seq model
+            outputs = model.generate(
+                input_ids=batch_input_ids_encoder,
+                decoder_input_ids=batch_input_ids,
+                decoder_start_length=batch_input_len[0],
+                **gen_kwargs,
             )
-            generated_tokens = generated_tokens.cpu().numpy()
-            generated_tasks = generated_tasks.cpu().numpy()
+        else:
+            # causal model
+            outputs = model.generate(
+                input_ids=batch_input_ids,
+                **gen_kwargs,
+            )
 
-            for sample, generated_tokens in zip(generated_tasks, generated_tokens):
-                gen_token_dict[sample].append(generated_tokens)
+        # Put generations in a dict with task_id as key
+        gen_dict = defaultdict(list)
+        for task_id, output in zip(batch_task_ids, outputs.tolist()):
+            gen_dict[task_id].append(output)
 
-            if save_every_k_tasks >= 1 and (step + 1) % save_every_k_tasks == 0:
-                if not intermediate_save_generations_path:
-                    raise ValueError(
-                        "intermediate_save_generations_path cannot be empty!"
-                    )
+        # Update generations
+        update_code_gens(
+            task,
+            tokenizer,
+            limit_start,
+            prefix,
+            instruction_tokens,
+            postprocess,
+            code_gens,
+            gen_dict,
+        )
 
-                code_gens = update_code_gens(
-                    task,
-                    tokenizer,
-                    limit_start,
-                    prefix,
-                    instruction_tokens,
-                    postprocess,
-                    code_gens,
-                    gen_token_dict,
+        if pbar is not None:
+            pbar.update(1)
+
+        # Save intermediate generations
+        if (
+            save_every_k_tasks > 0
+            and (i + n_samples) % (save_every_k_tasks * n_samples) == 0
+            and accelerator.is_main_process
+        ):
+            # Convert defaultdict to list
+            generations = [[] for _ in range(n_tasks)]
+            for task_id, gens in code_gens.items():
+                generations[task_id] = gens
+            # Add empty generations for remaining tasks
+            if intermediate_generations:
+                for task_id, gens in enumerate(intermediate_generations):
+                    if gens:
+                        generations[task_id] = gens
+            with open(intermediate_save_generations_path, "w") as fp:
+                json.dump(generations, fp)
+                print(
+                    f"intermediate generations saved at {intermediate_save_generations_path}"
                 )
-                with open(intermediate_save_generations_path, "w") as fp:
-                    json.dump(generations + code_gens, fp)
-                    print(
-                        f"intermediate generations were saved at {intermediate_save_generations_path}"
-                    )
-                # reset gen_token_dict - prevent redundant decoding
-                gen_token_dict = defaultdict(list)
 
-    code_gens = update_code_gens(
-        task,
-        tokenizer,
-        limit_start,
-        prefix,
-        instruction_tokens,
-        postprocess,
-        code_gens,
-        gen_token_dict,
-    )
+    if pbar is not None:
+        pbar.close()
 
-    generations.extend(code_gens)
+    # Convert defaultdict to list
+    generations = [[] for _ in range(n_tasks)]
+    for task_id, gens in code_gens.items():
+        generations[task_id] = gens
+    # Add empty generations for remaining tasks
+    if intermediate_generations:
+        for task_id, gens in enumerate(intermediate_generations):
+            if gens:
+                generations[task_id] = gens
+
     return generations
 
 

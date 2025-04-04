@@ -5,6 +5,7 @@ import warnings
 
 from typing import List
 
+from tqdm import tqdm
 
 from bigcode_eval import tasks
 from bigcode_eval.generation import parallel_generations
@@ -40,26 +41,37 @@ class Evaluator:
         # code evaluation permission
         self.allow_code_execution = args.allow_code_execution
 
-    def generate_text(self, task_name, intermediate_generations=None):
+    def generate_text(self, task_name, total_samples=None, intermediate_generations=None):
+        """Generates text for task
+        :param task_name: str
+            name of task to evaluate on
+        :param total_samples: int
+            total number of samples to generate (problems * n_samples)
+        :param intermediate_generations: list[list[str | None]]
+            list of lists of generated codes or empty
+        :return: tuple[list[list[str]], list[str]]
+            tuple of (generations, references)
+        """
         task = tasks.get_task(task_name, self.args)
-        dataset = task.get_dataset()
-        # if args.limit is None, use all samples
-        # if args.limit is used, make sure args.limit_start + args.limit <= len(dataset)
-        n_tasks = min(self.args.limit, len(dataset) - self.args.limit_start) if self.args.limit else len(dataset)
-        # when args.limit is None
-        # adjust n_tasks by args.limit_start to prevent out of bounds issues 
-        if not self.args.limit:
-            n_tasks -= self.args.limit_start
-        references = [task.get_reference(dataset[i]) for i in range(self.args.limit_start, self.args.limit_start+n_tasks)]
+        dataset = task.get_dataset()  # This now handles sequential/random selection
+        n_tasks = len(dataset)  # This is now the filtered size
+        n_samples = self.args.n_samples if hasattr(self.args, "n_samples") else 1
+        total_samples = n_tasks * n_samples
+
+        if self.accelerator.is_main_process:
+            print(f"Generating {n_samples} samples for each of {n_tasks} problems (total {total_samples} samples)...")
+
+        generations = []
+        references = [task.get_reference(dataset[i]) for i in range(n_tasks)]
 
         if self.args.check_references:
             if "get_solution" in inspect.signature(task.get_reference).parameters:
-                solutions = [[task.get_reference(dataset[i], get_solution=True)] for i in range(self.args.limit_start, self.args.limit_start+n_tasks)]
+                solutions = [[task.get_reference(dataset[i], get_solution=True)] for i in range(n_tasks)]
             else:
                 solutions = [[ref] for ref in references]
             return solutions, references
 
-        curr_generations = []  # list[list[str | None] | None]
+        curr_generations = []
         if intermediate_generations:
             curr_generations = [gen for gen in intermediate_generations if gen]
             n_tasks -= len(curr_generations)
@@ -74,37 +86,67 @@ class Evaluator:
             self.tokenizer,
             n_tasks=n_tasks,
             args=self.args,
-            curr_sample_idx=curr_sample_idx,  # curr_sample_idx will added to limit_start to fix indexing
+            curr_sample_idx=curr_sample_idx,
             save_every_k_tasks=self.args.save_every_k_tasks,
             intermediate_generations=curr_generations,
             intermediate_save_generations_path=intermediate_save_generations_path,
         )
 
-        if len(generations[0]) > self.args.n_samples:
-            generations = [l[: self.args.n_samples] for l in generations]
+        if len(generations[0]) > n_samples:
+            generations = [l[:n_samples] for l in generations]
             warnings.warn(
-                f"Number of tasks wasn't proportional to number of devices, we removed extra predictions to only keep nsamples={self.args.n_samples}"
+                f"Number of tasks wasn't proportional to number of devices, we removed extra predictions to only keep nsamples={n_samples}"
             )
         return generations, references
 
-    def evaluate(self, task_name, intermediate_generations=None):
-        task = tasks.get_task(task_name, self.args)
-        if task.requires_execution and not self.allow_code_execution:
-            raise ValueError(_WARNING)
+    def evaluate(self, task, total_samples=None, intermediate_generations=None):
+        """Evaluates the model on a task from the benchmark
+        :param task: str
+            name of task to evaluate on
+        :param total_samples: int
+            total number of samples to generate (problems * n_samples)
+        :param intermediate_generations: list[list[str | None]]
+            list of lists of generated codes or empty
+        :return: dict[str: float]
+            dict containing evaluation metrics
+        """
+        task_obj = tasks.get_task(task, self.args)
+        
+        if self.args.load_generations_path:
+            generations = self.load_generations(task)
+            references = self.load_references(task)
+            return task_obj.process_results(generations, references)
 
-        generations, references = self.generate_text(task_name, intermediate_generations=intermediate_generations)
+        if self.args.check_references:
+            solutions, references = self.generate_text(task, intermediate_generations=intermediate_generations)
+            return {
+                "solutions": solutions,
+                "references": references
+            }
+
+        # Get filtered dataset size
+        dataset = task_obj.get_dataset()
+        n_tasks = len(dataset)
+        n_samples = self.args.n_samples if hasattr(self.args, "n_samples") else 1
+        total_samples = n_tasks * n_samples
+
+        generations, references = self.generate_text(
+            task, total_samples=total_samples, intermediate_generations=intermediate_generations
+        )
 
         if self.accelerator.is_main_process:
             if not self.args.load_generations_path:
-                save_generations_path = f"{os.path.splitext(self.args.save_generations_path)[0]}_{task_name}.json"
-                self.save_json_files(generations, references, save_generations_path, f"references_{task_name}.json")
+                # Create directory if it doesn't exist
+                save_generations_path = f"{os.path.splitext(self.args.save_generations_path)[0]}_{task}.json"
+                os.makedirs(os.path.dirname(save_generations_path), exist_ok=True)
+                self.save_json_files(generations, references, save_generations_path, f"references_{task}.json")
 
             # make sure tokenizer plays nice with multiprocessing
             os.environ["TOKENIZERS_PARALLELISM"] = "false"
-            if self.allow_code_execution and task.requires_execution:
+            if self.allow_code_execution and task_obj.requires_execution:
                 os.environ["HF_ALLOW_CODE_EVAL"] = "1"
             print("Evaluating generations...")
-            results = task.process_results(generations, references)
+            results = task_obj.process_results(generations, references)
             return results
 
     def save_json_files(
