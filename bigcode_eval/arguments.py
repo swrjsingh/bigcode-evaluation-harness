@@ -59,3 +59,23 @@ class EvalArguments:
             "help": "Prompt template to use. Options: plain, wizardcoder, codellama, starcoder, octocoder, instructcodet5p, etc."
         },
     )
+    use_wandb: Optional[bool] = field(
+        default=True,
+        metadata={"help": "Whether to use Weights & Biases for experiment tracking"},
+    )
+    wandb_project: Optional[str] = field(
+        default="lora-compositionality",
+        metadata={"help": "Weights & Biases project name"},
+    )
+    wandb_entity: Optional[str] = field(
+        default=None,
+        metadata={"help": "Weights & Biases entity (team) name"},
+    )
+    wandb_run_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "Weights & Biases run name. If None, will be auto-generated"},
+    )
+    wandb_tags: Optional[str] = field(
+        default=None,
+        metadata={"help": "Comma-separated list of tags for this run"},
+    )

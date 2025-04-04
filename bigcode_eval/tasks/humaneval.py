@@ -11,6 +11,7 @@ Homepage: https://github.com/openai/human-eval
 from bigcode_eval.base import Task
 from bigcode_eval.tasks.custom_metrics.code_eval import compute_code_eval
 import random
+import wandb
 
 _CITATION = """
 @misc{chen2021evaluating,
@@ -77,6 +78,82 @@ class GeneralHumanEval(Task):
             self.k = k
         self.num_workers = num_workers
         self.timeout = timeout
+
+        if hasattr(self.args, "use_wandb") and self.args.use_wandb:
+            wandb_config = {
+                # Generation settings
+                "temperature": self.args.temperature,
+                "top_p": self.args.top_p,
+                "top_k": self.args.top_k,
+                "do_sample": self.args.do_sample,
+                "n_samples": self.args.n_samples,
+                "eos": self.args.eos,
+                # Dataset settings
+                "percent_problems": self.args.percent_problems,
+                "sequential_problems": self.args.sequential_problems,
+                "seed": self.args.seed,
+                # Evaluation settings
+                "pass_at_k": self.args.pass_at_k,
+                "num_workers": self.num_workers,
+                "timeout": self.timeout,
+                # Model settings
+                "model": self.args.model if hasattr(self.args, "model") else None,
+                "prompt_template": self.args.prompt_template,
+                "prefix": self.args.prefix,
+                # Other settings
+                "batch_size": self.args.batch_size
+                if hasattr(self.args, "batch_size")
+                else None,
+                "max_length_generation": self.args.max_length_generation
+                if hasattr(self.args, "max_length_generation")
+                else None,
+                "precision": self.args.precision
+                if hasattr(self.args, "precision")
+                else None,
+                "load_in_8bit": self.args.load_in_8bit
+                if hasattr(self.args, "load_in_8bit")
+                else None,
+                "load_in_4bit": self.args.load_in_4bit
+                if hasattr(self.args, "load_in_4bit")
+                else None,
+                "revision": self.args.revision
+                if hasattr(self.args, "revision")
+                else None,
+                "trust_remote_code": self.args.trust_remote_code
+                if hasattr(self.args, "trust_remote_code")
+                else None,
+                "use_auth_token": self.args.use_auth_token
+                if hasattr(self.args, "use_auth_token")
+                else None,
+                "peft_model": self.args.peft_model
+                if hasattr(self.args, "peft_model")
+                else None,
+            }
+
+            # Add any custom arguments that might be added in the future
+            for key, value in vars(self.args).items():
+                if key not in wandb_config and not key.startswith("wandb_"):
+                    wandb_config[key] = value
+
+            tags = (
+                self.args.wandb_tags.split(",")
+                if hasattr(self.args, "wandb_tags") and self.args.wandb_tags
+                else None
+            )
+
+            wandb.init(
+                project=self.args.wandb_project
+                if hasattr(self.args, "wandb_project")
+                else "lora-compositionality",
+                entity=self.args.wandb_entity
+                if hasattr(self.args, "wandb_entity")
+                else None,
+                name=self.args.wandb_run_name
+                if hasattr(self.args, "wandb_run_name")
+                else None,
+                config=wandb_config,
+                tags=tags,
+            )
 
     def get_dataset(self):
         """Returns dataset for the task or an iterable of any object, that get_prompt can handle"""
@@ -178,4 +255,21 @@ Create a Python script for this problem:
             num_workers=self.num_workers,
             timeout=self.timeout,
         )
+
+        # Log results to wandb if enabled
+        if hasattr(self.args, "use_wandb") and self.args.use_wandb:
+            wandb.log(results)
+
+            # Log additional metrics
+            wandb.log(
+                {
+                    "num_problems": len(references),
+                    "num_samples_per_problem": len(generations[0])
+                    if generations
+                    else 0,
+                    "total_samples": len(references)
+                    * (len(generations[0]) if generations else 0),
+                }
+            )
+
         return results
