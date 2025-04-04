@@ -2,15 +2,15 @@
 https://arxiv.org/abs/2107.03374
 
 The HumanEval dataset released by OpenAI includes 164 programming problems with a function signature,
-docstring, body, and several unit tests. 
+docstring, body, and several unit tests.
 They were handwritten to ensure not to be included in the training set of code generation models.
 
 Homepage: https://github.com/openai/human-eval
 """
 
-
 from bigcode_eval.base import Task
 from bigcode_eval.tasks.custom_metrics.code_eval import compute_code_eval
+import random
 
 _CITATION = """
 @misc{chen2021evaluating,
@@ -49,31 +49,107 @@ class GeneralHumanEval(Task):
 
     def __init__(self, strip_prompt, k=[1, 10, 100], num_workers=16, timeout=3.0):
         super().__init__(
-            stop_words=["\nclass", "\ndef", "\n#", "\n@", "\nprint", "\nif", "\n```", "<file_sep>"],
+            stop_words=[
+                "\nclass",
+                "\ndef",
+                "\n#",
+                "\n@",
+                "\nprint",
+                "\nif",
+                "\n```",
+                "<file_sep>",
+            ],
             requires_execution=True,
         )
         self.strip_prompt = strip_prompt
-        self.k = k
+        # Parse pass@k values from arguments and validate against n_samples
+        if hasattr(self.args, "pass_at_k"):
+            k_values = [int(k) for k in self.args.pass_at_k.split(",")]
+            n_samples = self.args.n_samples if hasattr(self.args, "n_samples") else 1
+            # Filter out k values that are too large
+            valid_k = [k for k in k_values if k <= n_samples]
+            if len(valid_k) < len(k_values):
+                print(
+                    f"Warning: Removed k values > n_samples ({n_samples}). Using k={valid_k}"
+                )
+            self.k = valid_k if valid_k else [1]  # Default to [1] if all k were invalid
+        else:
+            self.k = k
         self.num_workers = num_workers
         self.timeout = timeout
 
     def get_dataset(self):
         """Returns dataset for the task or an iterable of any object, that get_prompt can handle"""
-        return self.dataset["test"]
+        dataset = self.dataset["test"]
+        if hasattr(self.args, "percent_problems") and self.args.percent_problems < 1.0:
+            # Calculate number of problems to keep
+            num_problems = len(dataset)
+            num_to_keep = max(1, int(num_problems * self.args.percent_problems))
+
+            if (
+                hasattr(self.args, "sequential_problems")
+                and self.args.sequential_problems
+            ):
+                # Take first n% of problems
+                dataset = dataset.select(range(num_to_keep))
+            else:
+                # Randomly sample n% of problems
+                indices = list(range(num_problems))
+                random.seed(self.args.seed)  # Use same seed for reproducibility
+                selected_indices = random.sample(indices, num_to_keep)
+                dataset = dataset.select(selected_indices)
+        return dataset
+
+    def format_prompt(self, prompt_text):
+        """Apply prompt template based on model type"""
+        if (
+            not hasattr(self.args, "prompt_template")
+            or self.args.prompt_template == "plain"
+        ):
+            return prompt_text
+
+        template = self.args.prompt_template.lower()
+        if template == "wizardcoder":
+            return f"""Below is an instruction that describes a task. Write a response that appropriately completes the request.
+
+### Instruction:
+Create a Python script for this problem:
+{prompt_text}
+
+### Response:"""
+        elif template == "codellama":
+            return f"[INST] {prompt_text.strip()} [/INST]"
+        elif template == "starcoder":
+            return f"Question: {prompt_text}\n\nAnswer:\n"
+        elif template == "octocoder":
+            return f"Question: {prompt_text}\n\nAnswer:\n"
+        elif template == "instructcodet5p":
+            return f"Below is an instruction that describes a task. Write a response that appropriately completes the request.\n\n### Instruction:\n{prompt_text}\n\n### Response:"
+        elif template == "starchat":
+            return (
+                f"<|system|>\n<|end|>\n<|user|>\n{prompt_text}<|end|>\n<|assistant|>\n"
+            )
+        elif template == "deepseek":
+            return f"You are an AI programming assistant, utilizing the Deepseek Coder model, developed by Deepseek Company, and you only answer questions related to computer science. For politically sensitive questions, security and privacy issues, and other non-computer science questions, you will refuse to answer\n### Instruction:\n{prompt_text.strip()}\n### Response:\n"
+        elif template == "qwen":
+            return f"<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\n{prompt_text}<|im_end|>\n<|im_start|>assistant\n"
+        else:
+            print(f"Warning: Unknown prompt template '{template}'. Using plain format.")
+            return prompt_text
 
     def get_prompt(self, doc):
         """Builds the prompt for the LM to generate from."""
         if self.strip_prompt:
-            return doc["prompt"].strip()
+            prompt = doc["prompt"].strip()
         else:
-            return doc["prompt"]
+            prompt = doc["prompt"]
+        return self.format_prompt(prompt)
 
     def get_reference(self, doc):
         """Builds the reference solution for the doc (sample from the test dataset)."""
         test_func = doc["test"]
         entry_point = f"check({doc['entry_point']})"
         return "\n" + test_func + "\n" + entry_point
-
 
     def postprocess_generation(self, generation, idx):
         """Defines the postprocessing for a LM generation.

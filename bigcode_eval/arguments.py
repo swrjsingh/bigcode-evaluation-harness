@@ -7,6 +7,7 @@ class EvalArguments:
     """
     Configuration for running the evaluation.
     """
+
     prefix: Optional[str] = field(
         default="",
         metadata={
@@ -35,4 +36,26 @@ class EvalArguments:
     )
     seed: Optional[int] = field(
         default=0, metadata={"help": "Random seed used for evaluation."}
+    )
+    percent_problems: Optional[float] = field(
+        default=1.0,
+        metadata={"help": "Percentage of problems to evaluate (between 0 and 1)"},
+    )
+    sequential_problems: Optional[bool] = field(
+        default=True,
+        metadata={
+            "help": "If True, take first n% of problems. If False, randomly sample n%"
+        },
+    )
+    pass_at_k: Optional[str] = field(
+        default="1,5,10",
+        metadata={
+            "help": "Comma-separated list of k values for pass@k computation. Each k must be <= n_samples"
+        },
+    )
+    prompt_template: Optional[str] = field(
+        default="plain",
+        metadata={
+            "help": "Prompt template to use. Options: plain, wizardcoder, codellama, starcoder, octocoder, instructcodet5p, etc."
+        },
     )
